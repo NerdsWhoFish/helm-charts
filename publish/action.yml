@@ -1,0 +1,79 @@
+name: Publish chart
+description: Commit a validated, immutable chart package to the shared repository.
+inputs:
+  package:
+    description: Path to the packaged Helm chart.
+    required: true
+  app-id:
+    description: GitHub App ID with access to the shared chart repository.
+    required: true
+  app-private-key:
+    description: GitHub App private key used to mint a short-lived repository token.
+    required: true
+  branch:
+    description: Shared chart repository branch.
+    default: main
+runs:
+  using: composite
+  steps:
+    - name: Resolve archive
+      id: archive
+      shell: bash
+      env:
+        ARCHIVE: ${{ inputs.package }}
+      run: |
+        set -euo pipefail
+        test -f "$ARCHIVE"
+        printf 'path=%s\n' "$(realpath "$ARCHIVE")" >> "$GITHUB_OUTPUT"
+    - uses: actions/create-github-app-token@v3
+      id: token
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: NerdsWhoFish
+        repositories: helm-charts
+        permission-contents: write
+    - uses: actions/checkout@v4
+      with:
+        repository: NerdsWhoFish/helm-charts
+        ref: ${{ inputs.branch }}
+        path: .helm-repository
+        token: ${{ steps.token.outputs.token }}
+        fetch-depth: 0
+    - uses: actions/setup-go@v5
+      with:
+        go-version-file: .helm-repository/go.mod
+        cache-dependency-path: .helm-repository/go.sum
+    - name: Import and publish
+      shell: bash
+      working-directory: .helm-repository
+      env:
+        GOWORK: "off"
+        ARCHIVE: ${{ steps.archive.outputs.path }}
+        SOURCE_REPOSITORY: ${{ github.repository }}
+        TARGET_BRANCH: ${{ inputs.branch }}
+      run: |
+        set -euo pipefail
+        git check-ref-format --branch "$TARGET_BRANCH"
+        git config user.name "Helm chart publisher"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        go build -o "$RUNNER_TEMP/chart-import" ./cmd/charts
+        for attempt in 1 2 3 4 5; do
+          "$RUNNER_TEMP/chart-import" --import "$ARCHIVE" --source "$SOURCE_REPOSITORY"
+          git add -- packages
+          if git diff --cached --quiet; then
+            echo '{"event":"chart_publish","status":"already_present"}'
+            exit 0
+          fi
+          git commit -m "chore: publish chart package"
+          if git push origin "HEAD:refs/heads/$TARGET_BRANCH"; then
+            echo '{"event":"chart_publish","status":"published"}'
+            exit 0
+          fi
+          # Revalidate against the new head before retrying this disposable checkout.
+          git fetch origin "$TARGET_BRANCH"
+          git reset --hard FETCH_HEAD
+          sleep "$attempt"
+        done
+        echo "::error::Chart publication could not acquire the repository head."
+        exit 1

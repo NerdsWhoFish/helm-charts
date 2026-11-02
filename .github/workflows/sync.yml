@@ -1,0 +1,70 @@
+name: Sync charts to R2
+on:
+  push:
+    branches: [main]
+    paths:
+      - packages/**
+      - publishers.json
+      - cmd/**
+      - scripts/**
+      - .github/workflows/sync.yml
+      - go.mod
+      - go.sum
+      - index.html
+  workflow_dispatch:
+concurrency:
+  group: helm-r2-publication
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GOWORK: "off"
+    steps:
+      # Queued runs may arrive out of order; publish the current complete tree.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+      - run: go test ./...
+      - name: Validate and assemble repository
+        env:
+          PREVIOUS: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          go run ./cmd/charts --base "$PREVIOUS" --output dist
+          for package in dist/*.tgz; do
+            test -f "$package" || continue
+            helm lint --strict "$package"
+          done
+          helm repo index dist --url https://charts.nerdswhofish.com
+      - name: Publish archives, then index
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+        run: bash scripts/sync.sh
+      - name: Verify public repository
+        run: |
+          set -euo pipefail
+          helm repo add nerdswhofish https://charts.nerdswhofish.com --force-update
+          helm repo update nerdswhofish
+          for package in dist/*.tgz; do
+            test -f "$package" || continue
+            curl --fail --silent --show-error --retry 3 \
+              "https://charts.nerdswhofish.com/$(basename "$package")" \
+              --output "$RUNNER_TEMP/downloaded-chart.tgz"
+            cmp "$package" "$RUNNER_TEMP/downloaded-chart.tgz"
+          done

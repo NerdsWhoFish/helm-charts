@@ -1,0 +1,35 @@
+name: Check charts
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+      - run: go test -race ./...
+      - name: Validate immutable packages
+        env:
+          PREVIOUS: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: go run ./cmd/charts --base "$PREVIOUS" --output dist
+      - name: Validate Helm packaging
+        run: |
+          set -euo pipefail
+          for package in dist/*.tgz; do
+            test -f "$package" || continue
+            helm lint --strict "$package"
+          done
+          helm repo index dist --url https://charts.nerdswhofish.com
